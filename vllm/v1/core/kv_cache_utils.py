@@ -17,6 +17,7 @@ from vllm.v1.kv_cache_interface import (ChunkedLocalAttentionSpec,
                                         KVCacheTensor, SlidingWindowSpec)
 from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
+import vllm.envs as envs
 
 logger = init_logger(__name__)
 
@@ -826,6 +827,10 @@ def _get_kv_cache_config_uniform_type(vllm_config: VllmConfig,
     page_size = get_uniform_page_size(kv_cache_spec)
     num_blocks = get_num_blocks(vllm_config, len(kv_cache_spec),
                                 available_memory, page_size)
+    virtual_page_size_factor = envs.VLLM_VIRTUAL_PAGE_SIZE_FACTOR
+    logger.info(f"old page size {page_size}, old num blocks {num_blocks}")
+    num_blocks = num_blocks // virtual_page_size_factor * virtual_page_size_factor
+    logger.info(f"new page size {page_size}, new num blocks {num_blocks}")
 
     per_layer_size = page_size * num_blocks
     # All layers have the same KV cache spec, so we create one kv cache group

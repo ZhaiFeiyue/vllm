@@ -12,7 +12,7 @@ from vllm.v1.kv_cache_interface import (ChunkedLocalAttentionSpec,
                                         KVCacheSpec, MambaSpec,
                                         SlidingWindowSpec)
 from vllm.v1.request import Request
-
+import vllm.envs as envs
 
 class SingleTypeKVCacheManager(ABC):
     """
@@ -35,6 +35,7 @@ class SingleTypeKVCacheManager(ABC):
         """
 
         self.block_size = kv_cache_spec.block_size
+        self.virtual_page_size_factor = envs.VLLM_VIRTUAL_PAGE_SIZE_FACTOR
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
 
@@ -42,6 +43,10 @@ class SingleTypeKVCacheManager(ABC):
         # for each request, so that we can free the blocks when the request
         # is finished.
         self.req_to_blocks: defaultdict[str,
+                                        list[KVCacheBlock]] = defaultdict(list)
+
+        # pre-reserved_blocks for requests
+        self.req_to_reserved_blocks:defaultdict[str,
                                         list[KVCacheBlock]] = defaultdict(list)
 
         # {req_id: The number of cached blocks for this given request}
@@ -123,8 +128,35 @@ class SingleTypeKVCacheManager(ABC):
         if num_new_blocks <= 0:
             return []
         else:
-            new_blocks = self.block_pool.get_new_blocks(num_new_blocks)
-            req_blocks.extend(new_blocks)
+            # check if has reserved blocks for request
+            req_reserved_blocks = self.req_to_reserved_blocks.get(request_id, [])
+            if len(req_reserved_blocks) == 0:
+                # no reserved blocks for request, allocte new blocks
+                new_blocks = []
+                real_num_new_blocks = num_new_blocks
+            else:
+                if num_new_blocks <= len(req_reserved_blocks):
+                    # blocks in reserved buffer is enough
+                    new_blocks = req_reserved_blocks[:num_new_blocks]
+                    self.req_to_reserved_blocks[request_id] = req_reserved_blocks[num_new_blocks:]
+                    req_blocks.extend(new_blocks)
+                    return new_blocks
+                else:
+                    new_blocks = self.req_to_reserved_blocks[request_id]
+                    real_num_new_blocks = num_new_blocks - len(req_reserved_blocks)
+                    # move reserved blocks into req_to_blocks
+                    req_blocks.extend(new_blocks)
+                    self.req_to_reserved_blocks[request_id] = []
+
+            real_num_allocate_blocks = cdiv(real_num_new_blocks, self.virtual_page_size_factor) * self.virtual_page_size_factor
+            real_allocate_blocks = self.block_pool.get_new_blocks(real_num_allocate_blocks)
+            real_used_blocks = real_allocate_blocks[:real_num_new_blocks]
+            # move used blocks, which in new virtual page size, into req_to_blocks
+            req_blocks.extend(real_used_blocks)
+            new_blocks.extend(real_used_blocks)
+
+            # move pre reserved blocks into req_to_reserved_blocks
+            self.req_to_reserved_blocks[request_id].extend(real_allocate_blocks[real_num_new_blocks:])
             return new_blocks
 
     def cache_blocks(self, request: Request, num_tokens: int) -> None:
@@ -159,6 +191,9 @@ class SingleTypeKVCacheManager(ABC):
         """
         # Default to [] in case a request is freed (aborted) before alloc.
         req_blocks = self.req_to_blocks.pop(request_id, [])
+        # if free blocks of request, also need to free reserved blocks for request
+        req_reserved_blocks = self.req_to_reserved_blocks.pop(request_id, [])
+        req_blocks.extend(req_reserved_blocks)
 
         # Free blocks in reverse order so that the tail blocks are
         # freed first.
